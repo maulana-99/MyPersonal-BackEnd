@@ -3,6 +3,7 @@ package handler
 import (
 	"time"
 
+	"github.com/chronaxis/daily-planner-backend/internal/googlecal"
 	"github.com/chronaxis/daily-planner-backend/internal/middleware"
 	"github.com/chronaxis/daily-planner-backend/pkg/response"
 	"github.com/gin-gonic/gin"
@@ -12,7 +13,8 @@ import (
 
 // NoteHandler owns standalone notes and notes attached to a schedule or task.
 type NoteHandler struct {
-	db *pgxpool.Pool
+	db    *pgxpool.Pool
+	drive *googlecal.NotesService // nil = notes are always local
 }
 
 func NewNoteHandler(db *pgxpool.Pool) *NoteHandler {
@@ -27,6 +29,14 @@ type Note struct {
 	TaskID     *uuid.UUID `json:"task_id"`
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
+
+	// Drive-shaped fields, defaults only in local mode.
+	Preview  string   `json:"preview"`
+	Pinned   bool     `json:"pinned"`
+	Archived bool     `json:"archived"`
+	Color    *string  `json:"color"`
+	Labels   []string `json:"labels"`
+	Trashed  bool     `json:"trashed"`
 }
 
 type noteRequest struct {
@@ -44,11 +54,18 @@ func scanNote(row rowScanner) (Note, error) {
 	if err != nil {
 		return Note{}, err
 	}
+	n.Preview, n.Labels = googlecal.Preview(n.Body), []string{}
 	return n, nil
 }
 
 // List: GET /notes?schedule_id=&task_id=
 func (h *NoteHandler) List(c *gin.Context) {
+	if use, stop := h.useDrive(c); stop {
+		return
+	} else if use {
+		h.driveList(c)
+		return
+	}
 	userID := middleware.GetUserID(c)
 	p := pagination(c)
 
@@ -103,6 +120,12 @@ func (h *NoteHandler) List(c *gin.Context) {
 }
 
 func (h *NoteHandler) Get(c *gin.Context) {
+	if use, stop := h.useDrive(c); stop {
+		return
+	} else if use {
+		h.driveGet(c)
+		return
+	}
 	id, ok := paramUUID(c, "id")
 	if !ok {
 		return
@@ -118,6 +141,12 @@ func (h *NoteHandler) Get(c *gin.Context) {
 }
 
 func (h *NoteHandler) Create(c *gin.Context) {
+	if use, stop := h.useDrive(c); stop {
+		return
+	} else if use {
+		h.driveCreate(c)
+		return
+	}
 	var req noteRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
@@ -153,6 +182,12 @@ func (h *NoteHandler) Create(c *gin.Context) {
 
 // Update rewrites the note and its attachments. Sending null detaches.
 func (h *NoteHandler) Update(c *gin.Context) {
+	if use, stop := h.useDrive(c); stop {
+		return
+	} else if use {
+		h.driveUpdate(c)
+		return
+	}
 	id, ok := paramUUID(c, "id")
 	if !ok {
 		return
@@ -194,6 +229,12 @@ func (h *NoteHandler) Update(c *gin.Context) {
 }
 
 func (h *NoteHandler) Delete(c *gin.Context) {
+	if use, stop := h.useDrive(c); stop {
+		return
+	} else if use {
+		h.driveDelete(c)
+		return
+	}
 	id, ok := paramUUID(c, "id")
 	if !ok {
 		return

@@ -2,8 +2,10 @@ package handler
 
 import (
 	"context"
+	"net/http"
 	"time"
 
+	"github.com/chronaxis/daily-planner-backend/internal/googlecal"
 	"github.com/chronaxis/daily-planner-backend/internal/middleware"
 	"github.com/chronaxis/daily-planner-backend/internal/queue"
 	"github.com/chronaxis/daily-planner-backend/pkg/response"
@@ -25,7 +27,12 @@ const (
 type ScheduleHandler struct {
 	db *pgxpool.Pool
 	q  *queue.Client // nil in tests / API-only mode → reminders are not enqueued
+
+	google *googlecal.Service // nil when Google sync is not configured
 }
+
+// SetGoogle enables Google Calendar push/delete.
+func (h *ScheduleHandler) SetGoogle(g *googlecal.Service) { h.google = g }
 
 func NewScheduleHandler(db *pgxpool.Pool, q *queue.Client) *ScheduleHandler {
 	return &ScheduleHandler{db: db, q: q}
@@ -45,6 +52,17 @@ type Schedule struct {
 	Reminders    []int      `json:"reminders"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
+
+	Source          string  `json:"source"`
+	GoogleEventID   *string `json:"google_event_id"`
+	GoogleSyncState *string `json:"google_sync_state"`
+	GoogleSyncError *string `json:"google_sync_error"`
+
+	Location  *string    `json:"location"`
+	ColorID   *string    `json:"color_id"`
+	MeetLink  *string    `json:"meet_link"`
+	Timezone  string     `json:"timezone"`
+	Attendees []Attendee `json:"attendees"`
 }
 
 type scheduleRequest struct {
@@ -55,7 +73,15 @@ type scheduleRequest struct {
 	EndTime     *time.Time `json:"end_time"`
 	AllDay      bool       `json:"all_day"`
 	Recurrence  string     `json:"recurrence"  binding:"omitempty,max=500"`
-	Reminders   []int      `json:"reminders"   binding:"omitempty,dive,min=0,max=1440"`
+	Reminders   []int      `json:"reminders"   binding:"omitempty,dive,min=0,max=40320"`
+
+	// v2 (docs/google-sync-v2.md); push_to_google is gone (docs/google-first.md), unknown JSON keys are ignored. nil Reminders/Attendees/AddMeet/Timezone "" = keep on PUT.
+	Location    string   `json:"location"    binding:"max=300"`
+	ColorID     *string  `json:"color_id"`
+	Timezone    string   `json:"timezone"`
+	Attendees   []string `json:"attendees"`
+	SendUpdates string   `json:"send_updates" binding:"omitempty,oneof=all none"`
+	AddMeet     *bool    `json:"add_meet"`
 }
 
 // computedStatus derives the live status of a schedule from the clock.
@@ -80,7 +106,9 @@ func computedStatus(start time.Time, end *time.Time, stored string, now time.Tim
 
 const scheduleColumns = `s.id, s.category_id, s.title, COALESCE(s.description, ''),
 	s.start_time, s.end_time, s.all_day, s.status,
-	COALESCE(r.rule, ''), s.created_at, s.updated_at`
+	COALESCE(r.rule, ''), s.created_at, s.updated_at,
+	s.source, s.google_event_id, s.google_sync_state, s.google_sync_error,
+	s.location, s.color_id, s.meet_link, s.tz`
 
 const scheduleFrom = `FROM schedules s
 	LEFT JOIN schedule_recurrences r ON r.schedule_id = s.id`
@@ -169,6 +197,10 @@ func (h *ScheduleHandler) List(c *gin.Context) {
 	for i := range schedules {
 		schedules[i].Reminders = reminders[schedules[i].ID]
 	}
+	if err := attachAttendees(c, h.db, schedules); err != nil {
+		respondDBError(c, err)
+		return
+	}
 
 	response.OK(c, schedules)
 }
@@ -192,8 +224,22 @@ func (h *ScheduleHandler) Get(c *gin.Context) {
 		return
 	}
 	s.Reminders = reminders[id]
+	if !h.attachOne(c, &s) {
+		return
+	}
 
 	response.OK(c, s)
+}
+
+// attachOne loads the guests of one schedule; it writes the error response on failure.
+func (h *ScheduleHandler) attachOne(c *gin.Context, s *Schedule) bool {
+	one := []Schedule{*s}
+	if err := attachAttendees(c, h.db, one); err != nil {
+		respondDBError(c, err)
+		return false
+	}
+	s.Attendees = one[0].Attendees
+	return true
 }
 
 func (h *ScheduleHandler) Create(c *gin.Context) {
@@ -206,18 +252,54 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 		response.BadRequest(c, "end_time must not be before start_time")
 		return
 	}
+	if code := req.validate(); code != "" {
+		response.Error(c, http.StatusBadRequest, code)
+		return
+	}
 
 	userID := middleware.GetUserID(c)
+	id, ok := h.create(c, userID, req)
+	if !ok {
+		return
+	}
+	h.respondSchedule(c, id, userID, true)
+}
+
+// create is the write-through insert shared by Create and Duplicate: Google
+// first, then the local cache. On any Google failure nothing is stored. It
+// writes the error response and returns ok=false on failure. With Google not
+// configured at all, schedules stay local-only (dev setups and tests).
+func (h *ScheduleHandler) create(c *gin.Context, userID uuid.UUID, req scheduleRequest) (uuid.UUID, bool) {
+	if !h.gate(c, userID) {
+		return uuid.Nil, false
+	}
+	var ev googlecal.Event
+	var res googlecal.Result
+	if h.google != nil {
+		req.applyTo(&ev)
+		ev.Recurrence = req.Recurrence
+		var err error
+		if res, err = h.google.InsertRemote(c, userID, &ev, req.pushOpts()); err != nil {
+			googleError(c, err)
+			return uuid.Nil, false
+		}
+	}
 
 	var id uuid.UUID
 	err := h.db.QueryRow(c, `
-		INSERT INTO schedules (user_id, category_id, title, description, start_time, end_time, all_day)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO schedules (user_id, category_id, title, description, start_time, end_time, all_day,
+		                       location, color_id, tz, google_event_id, google_etag, meet_link)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9, COALESCE(NULLIF($10, ''), 'UTC'),
+		        NULLIF($11, ''), NULLIF($12, ''), NULLIF($13, ''))
 		RETURNING id
-	`, userID, req.CategoryID, req.Title, req.Description, req.StartTime, req.EndTime, req.AllDay).Scan(&id)
+	`, userID, req.CategoryID, req.Title, req.Description, req.StartTime, req.EndTime, req.AllDay,
+		req.Location, req.ColorID, req.Timezone, res.ID, res.ETag, res.MeetLink).Scan(&id)
 	if err != nil {
+		if res.ID != "" { // do not leave an orphan event behind
+			_ = h.google.DeleteRemote(c, userID, res.ID, "none")
+		}
 		respondDBError(c, err)
-		return
+		return uuid.Nil, false
 	}
 
 	if req.Recurrence != "" {
@@ -225,15 +307,72 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 			INSERT INTO schedule_recurrences (schedule_id, rule) VALUES ($1, $2)
 		`, id, req.Recurrence); err != nil {
 			respondDBError(c, err)
-			return
+			return uuid.Nil, false
 		}
 	}
 
 	if err := h.syncReminders(c, id, userID, req); err != nil {
 		respondDBError(c, err)
-		return
+		return uuid.Nil, false
 	}
+	if err := replaceAttendees(c, h.db, id, req.Attendees); err != nil {
+		respondDBError(c, err)
+		return uuid.Nil, false
+	}
+	h.syncSeries(userID, req.Recurrence)
+	return id, true
+}
 
+// gate checks, before any write, that Google is usable (409 not_connected /
+// needs_reauth otherwise). Always true when Google is not configured.
+func (h *ScheduleHandler) gate(c *gin.Context, userID uuid.UUID) bool {
+	if h.google == nil {
+		return true
+	}
+	if err := h.google.Require(c, userID); err != nil {
+		googleError(c, err)
+		return false
+	}
+	return true
+}
+
+// syncSeries pulls Google's view after a recurring-series write so instances appear.
+func (h *ScheduleHandler) syncSeries(userID uuid.UUID, recurrence string) {
+	if h.google != nil && recurrence != "" {
+		h.google.SyncBackground(userID)
+	}
+}
+
+// remoteWrite loads schedule id as a Google event, lets mutate change it, and
+// writes it to Google (insert when the row has no event yet, else patch)
+// BEFORE the caller touches local data. Returns ok=false after writing the
+// error response. With Google not configured it is a no-op.
+func (h *ScheduleHandler) remoteWrite(c *gin.Context, userID, id uuid.UUID, opts googlecal.PushOpts,
+	mutate func(*googlecal.Event)) (ev googlecal.Event, res googlecal.Result, ok bool) {
+	if h.google == nil {
+		return ev, res, true
+	}
+	ev, evID, err := h.google.LoadEvent(c, userID, id)
+	if err != nil {
+		respondDBError(c, err)
+		return ev, res, false
+	}
+	mutate(&ev)
+	if evID == "" {
+		res, err = h.google.InsertRemote(c, userID, &ev, opts)
+	} else {
+		res, err = h.google.PatchRemote(c, userID, evID, &ev, opts)
+		res.ID = evID
+	}
+	if err != nil {
+		googleError(c, err)
+		return ev, res, false
+	}
+	return ev, res, true
+}
+
+// respondSchedule writes the schedule with its reminders and guests.
+func (h *ScheduleHandler) respondSchedule(c *gin.Context, id, userID uuid.UUID, created bool) {
 	s, err := h.fetch(c, id, userID, time.Now())
 	if err != nil {
 		respondDBError(c, err)
@@ -241,8 +380,14 @@ func (h *ScheduleHandler) Create(c *gin.Context) {
 	}
 	reminders, _ := h.remindersFor(c, []uuid.UUID{id})
 	s.Reminders = reminders[id]
-
-	response.Created(c, s)
+	if !h.attachOne(c, &s) {
+		return
+	}
+	if created {
+		response.Created(c, s)
+		return
+	}
+	response.OK(c, s)
 }
 
 func (h *ScheduleHandler) Update(c *gin.Context) {
@@ -260,16 +405,42 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 		response.BadRequest(c, "end_time must not be before start_time")
 		return
 	}
+	if code := req.validate(); code != "" {
+		response.Error(c, http.StatusBadRequest, code)
+		return
+	}
 
 	userID := middleware.GetUserID(c)
+
+	cur, ok := h.current(c, id, userID)
+	if !ok || !h.gate(c, userID) {
+		return
+	}
+	if cur.imported {
+		req.Recurrence = "" // instances never carry a rule
+	}
+
+	// Google first, so a failure leaves the local row unchanged.
+	ev, res, ok := h.remoteWrite(c, userID, id, req.pushOpts(), func(e *googlecal.Event) {
+		req.applyTo(e)
+		if !cur.imported {
+			e.Recurrence = req.Recurrence
+		}
+	})
+	if !ok {
+		return
+	}
 
 	// user_id in WHERE is the ownership check — a foreign row updates 0 rows.
 	tag, err := h.db.Exec(c, `
 		UPDATE schedules
 		SET category_id = $1, title = $2, description = $3,
-		    start_time = $4, end_time = $5, all_day = $6, updated_at = NOW()
+		    start_time = $4, end_time = $5, all_day = $6,
+		    location = NULLIF($9, ''), color_id = $10, tz = COALESCE(NULLIF($11, ''), tz),
+		    updated_at = NOW()
 		WHERE id = $7 AND user_id = $8
-	`, req.CategoryID, req.Title, req.Description, req.StartTime, req.EndTime, req.AllDay, id, userID)
+	`, req.CategoryID, req.Title, req.Description, req.StartTime, req.EndTime, req.AllDay, id, userID,
+		req.Location, req.ColorID, req.Timezone)
 	if err != nil {
 		respondDBError(c, err)
 		return
@@ -279,34 +450,44 @@ func (h *ScheduleHandler) Update(c *gin.Context) {
 		return
 	}
 
-	// Replace the recurrence rule.
-	if _, err := h.db.Exec(c, `DELETE FROM schedule_recurrences WHERE schedule_id = $1`, id); err != nil {
+	if !cur.imported {
+		// Replace the recurrence rule.
+		if _, err := h.db.Exec(c, `DELETE FROM schedule_recurrences WHERE schedule_id = $1`, id); err != nil {
+			respondDBError(c, err)
+			return
+		}
+		if req.Recurrence != "" {
+			if _, err := h.db.Exec(c, `
+				INSERT INTO schedule_recurrences (schedule_id, rule) VALUES ($1, $2)
+			`, id, req.Recurrence); err != nil {
+				respondDBError(c, err)
+				return
+			}
+		}
+	}
+
+	if req.Reminders == nil { // omitted = keep, but fire times follow the new start
+		if req.Reminders, err = reminderOffsets(c, h.db, id); err != nil {
+			respondDBError(c, err)
+			return
+		}
+	}
+	if err := h.syncReminders(c, id, userID, req); err != nil {
 		respondDBError(c, err)
 		return
 	}
-	if req.Recurrence != "" {
-		if _, err := h.db.Exec(c, `
-			INSERT INTO schedule_recurrences (schedule_id, rule) VALUES ($1, $2)
-		`, id, req.Recurrence); err != nil {
+	if req.Attendees != nil {
+		if err := replaceAttendees(c, h.db, id, req.Attendees); err != nil {
 			respondDBError(c, err)
 			return
 		}
 	}
 
-	if err := h.syncReminders(c, id, userID, req); err != nil {
-		respondDBError(c, err)
-		return
+	if h.google != nil {
+		_ = h.google.Record(c, userID, id, res, ev)
+		h.syncSeries(userID, ev.Recurrence)
 	}
-
-	s, err := h.fetch(c, id, userID, time.Now())
-	if err != nil {
-		respondDBError(c, err)
-		return
-	}
-	reminders, _ := h.remindersFor(c, []uuid.UUID{id})
-	s.Reminders = reminders[id]
-
-	response.OK(c, s)
+	h.respondSchedule(c, id, userID, false)
 }
 
 func (h *ScheduleHandler) Delete(c *gin.Context) {
@@ -316,13 +497,36 @@ func (h *ScheduleHandler) Delete(c *gin.Context) {
 	}
 	userID := middleware.GetUserID(c)
 
-	tag, err := h.db.Exec(c, `DELETE FROM schedules WHERE id = $1 AND user_id = $2`, id, userID)
-	if err != nil {
+	var eventID *string
+	if err := h.db.QueryRow(c, `SELECT google_event_id FROM schedules WHERE id = $1 AND user_id = $2`,
+		id, userID).Scan(&eventID); err != nil {
 		respondDBError(c, err)
 		return
 	}
-	if tag.RowsAffected() == 0 {
-		response.NotFound(c)
+	if !h.gate(c, userID) {
+		return
+	}
+
+	// Guests are only notified of the cancellation when there are any.
+	sendUpdates := "none"
+	var guests int
+	if err := h.db.QueryRow(c, `SELECT COUNT(*) FROM schedule_attendees WHERE schedule_id = $1`,
+		id).Scan(&guests); err == nil && guests > 0 {
+		sendUpdates = "all"
+	}
+	if q := c.Query("send_updates"); q == "all" || q == "none" {
+		sendUpdates = q
+	}
+
+	// Google first, so a failure leaves the local row in place.
+	if eventID != nil && h.google != nil {
+		if err := h.google.DeleteRemote(c, userID, *eventID, sendUpdates); err != nil {
+			googleError(c, err)
+			return
+		}
+	}
+	if _, err := h.db.Exec(c, `DELETE FROM schedules WHERE id = $1 AND user_id = $2`, id, userID); err != nil {
+		respondDBError(c, err)
 		return
 	}
 
@@ -370,42 +574,19 @@ func (h *ScheduleHandler) Duplicate(c *gin.Context) {
 		AllDay:      src.AllDay,
 		Recurrence:  src.Recurrence,
 		Reminders:   srcReminders[src.ID],
+		ColorID:     src.ColorID,
+		Timezone:    src.Timezone,
+	}
+	if src.Location != nil {
+		req.Location = *src.Location
 	}
 
-	var newID uuid.UUID
-	err = h.db.QueryRow(c, `
-		INSERT INTO schedules (user_id, category_id, title, description, start_time, end_time, all_day)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id
-	`, userID, req.CategoryID, req.Title, req.Description, req.StartTime, req.EndTime, req.AllDay).Scan(&newID)
-	if err != nil {
-		respondDBError(c, err)
+	newID, ok := h.create(c, userID, req)
+	if !ok {
 		return
 	}
 
-	if req.Recurrence != "" {
-		if _, err := h.db.Exec(c, `
-			INSERT INTO schedule_recurrences (schedule_id, rule) VALUES ($1, $2)
-		`, newID, req.Recurrence); err != nil {
-			respondDBError(c, err)
-			return
-		}
-	}
-
-	if err := h.syncReminders(c, newID, userID, req); err != nil {
-		respondDBError(c, err)
-		return
-	}
-
-	s, err := h.fetch(c, newID, userID, time.Now())
-	if err != nil {
-		respondDBError(c, err)
-		return
-	}
-	reminders, _ := h.remindersFor(c, []uuid.UUID{newID})
-	s.Reminders = reminders[newID]
-
-	response.Created(c, s)
+	h.respondSchedule(c, newID, userID, true)
 }
 
 type moveRequest struct {
@@ -433,6 +614,18 @@ func (h *ScheduleHandler) Move(c *gin.Context) {
 	}
 
 	userID := middleware.GetUserID(c)
+
+	if _, ok := h.current(c, id, userID); !ok || !h.gate(c, userID) {
+		return
+	}
+
+	// Google first, so a failure leaves the local row unchanged.
+	ev, res, ok := h.remoteWrite(c, userID, id, googlecal.PushOpts{}, func(e *googlecal.Event) {
+		e.Start, e.End = req.StartTime, req.EndTime
+	})
+	if !ok {
+		return
+	}
 
 	tag, err := h.db.Exec(c, `
 		UPDATE schedules SET start_time = $1, end_time = $2, updated_at = NOW()
@@ -481,16 +674,36 @@ func (h *ScheduleHandler) Move(c *gin.Context) {
 		respondDBError(c, err)
 		return
 	}
+	if h.google != nil {
+		_ = h.google.Record(c, userID, id, res, ev)
+		h.syncSeries(userID, ev.Recurrence)
+	}
 
-	s, err := h.fetch(c, id, userID, time.Now())
+	h.respondSchedule(c, id, userID, false)
+}
+
+// ---- google ----------------------------------------------------------------
+
+// scheduleLink is the Google state of a schedule row.
+type scheduleLink struct {
+	imported bool // source='google'
+}
+
+// current loads the row's Google state. It writes 404 for a missing/foreign row.
+func (h *ScheduleHandler) current(c *gin.Context, id, userID uuid.UUID) (scheduleLink, bool) {
+	var source string
+	err := h.db.QueryRow(c, `SELECT source FROM schedules WHERE id = $1 AND user_id = $2`,
+		id, userID).Scan(&source)
 	if err != nil {
 		respondDBError(c, err)
-		return
+		return scheduleLink{}, false
 	}
-	reminders, _ := h.remindersFor(c, []uuid.UUID{id})
-	s.Reminders = reminders[id]
+	return scheduleLink{imported: source == "google"}, true
+}
 
-	response.OK(c, s)
+// GoogleRetry is gone: writes are write-through, so there is nothing to retry.
+func (h *ScheduleHandler) GoogleRetry(c *gin.Context) {
+	response.Error(c, http.StatusGone, "gone")
 }
 
 // ---- reminders (snooze / dismiss) -----------------------------------------
@@ -698,6 +911,9 @@ func (h *ScheduleHandler) setStatus(c *gin.Context, status string) {
 		respondDBError(c, err)
 		return
 	}
+	if !h.attachOne(c, &s) {
+		return
+	}
 	response.OK(c, s)
 }
 
@@ -712,12 +928,15 @@ func scanSchedule(row rowScanner, now time.Time) (Schedule, error) {
 	var stored string
 	err := row.Scan(&s.ID, &s.CategoryID, &s.Title, &s.Description,
 		&s.StartTime, &s.EndTime, &s.AllDay, &stored,
-		&s.Recurrence, &s.CreatedAt, &s.UpdatedAt)
+		&s.Recurrence, &s.CreatedAt, &s.UpdatedAt,
+		&s.Source, &s.GoogleEventID, &s.GoogleSyncState, &s.GoogleSyncError,
+		&s.Location, &s.ColorID, &s.MeetLink, &s.Timezone)
 	if err != nil {
 		return Schedule{}, err
 	}
 	s.Status = computedStatus(s.StartTime, s.EndTime, stored, now)
 	s.Reminders = []int{}
+	s.Attendees = []Attendee{}
 	return s, nil
 }
 
@@ -728,12 +947,15 @@ func scanScheduleRow(row rowScanner, now time.Time) (Schedule, error) {
 	var stored string
 	err := row.Scan(&s.ID, &s.OccurrenceID, &s.CategoryID, &s.Title, &s.Description,
 		&s.StartTime, &s.EndTime, &s.AllDay, &stored,
-		&s.Recurrence, &s.CreatedAt, &s.UpdatedAt)
+		&s.Recurrence, &s.CreatedAt, &s.UpdatedAt,
+		&s.Source, &s.GoogleEventID, &s.GoogleSyncState, &s.GoogleSyncError,
+		&s.Location, &s.ColorID, &s.MeetLink, &s.Timezone)
 	if err != nil {
 		return Schedule{}, err
 	}
 	s.Status = computedStatus(s.StartTime, s.EndTime, stored, now)
 	s.Reminders = []int{}
+	s.Attendees = []Attendee{}
 	return s, nil
 }
 

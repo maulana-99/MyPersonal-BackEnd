@@ -160,7 +160,7 @@ func TestScheduleValidation(t *testing.T) {
 
 	// Reminder offset out of range.
 	w = doJSON(t, r, http.MethodPost, "/schedules", token, gin.H{
-		"title": "Bad", "start_time": start, "reminders": []int{9999},
+		"title": "Bad", "start_time": start, "reminders": []int{50000},
 	})
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
 }

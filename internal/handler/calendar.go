@@ -55,7 +55,9 @@ func (h *CalendarHandler) List(c *gin.Context) {
 	rows, err := h.db.Query(c, `
 		SELECT s.id, NULL::uuid AS occurrence_id, s.category_id, s.title,
 		       COALESCE(s.description, ''), s.start_time, s.end_time, s.all_day,
-		       s.status, COALESCE(r.rule, ''), s.created_at, s.updated_at
+		       s.status, COALESCE(r.rule, ''), s.created_at, s.updated_at,
+		       s.source, s.google_event_id, s.google_sync_state, s.google_sync_error,
+			       s.location, s.color_id, s.meet_link, s.tz
 		FROM schedules s
 		LEFT JOIN schedule_recurrences r ON r.schedule_id = s.id
 		WHERE s.user_id = $1
@@ -67,7 +69,9 @@ func (h *CalendarHandler) List(c *gin.Context) {
 
 		SELECT s.id, o.id AS occurrence_id, s.category_id, s.title,
 		       COALESCE(s.description, ''), o.occurrence_start, o.occurrence_end, s.all_day,
-		       o.status, COALESCE(r.rule, ''), s.created_at, s.updated_at
+		       o.status, COALESCE(r.rule, ''), s.created_at, s.updated_at,
+		       s.source, s.google_event_id, s.google_sync_state, s.google_sync_error,
+			       s.location, s.color_id, s.meet_link, s.tz
 		FROM schedule_occurrences o
 		JOIN schedules s ON s.id = o.schedule_id
 		JOIN schedule_recurrences r ON r.schedule_id = s.id
@@ -107,6 +111,11 @@ func (h *CalendarHandler) List(c *gin.Context) {
 	}
 	for i := range schedules {
 		schedules[i].Reminders = reminders[schedules[i].ID]
+	}
+
+	if err := attachAttendees(c, h.db, schedules); err != nil {
+		respondDBError(c, err)
+		return
 	}
 
 	response.OK(c, gin.H{

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/chronaxis/daily-planner-backend/internal/config"
+	"github.com/chronaxis/daily-planner-backend/internal/googlecal"
 	"github.com/chronaxis/daily-planner-backend/internal/handler"
 	"github.com/chronaxis/daily-planner-backend/internal/middleware"
 	"github.com/chronaxis/daily-planner-backend/internal/queue"
@@ -53,7 +54,7 @@ func main() {
 		c.Header("Access-Control-Allow-Origin", "http://localhost:5173")
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
@@ -76,10 +77,21 @@ func main() {
 		defer queueClient.Close()
 	}
 
+	// Google Calendar sync: nil service = feature off (routes answer 503).
+	var googleSvc *googlecal.Service
+	if cfg.GoogleEnabled() {
+		googleSvc = googlecal.NewService(db,
+			googlecal.NewClient(cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL, cfg.GoogleLoginRedirectURL),
+			cfg.GoogleTokenKey, cfg.JWTSecret)
+	}
+
 	// Handlers
 	authHandler := handler.NewAuthHandler(db, jwtMgr)
+	authHandler.SetGoogle(googleSvc, cfg.FrontendURL, cfg.GoogleAllowedEmails, cfg.AllowPasswordAuth)
 	categoryHandler := handler.NewCategoryHandler(db)
 	scheduleHandler := handler.NewScheduleHandler(db, queueClient)
+	scheduleHandler.SetGoogle(googleSvc)
+	googleHandler := handler.NewGoogleHandler(googleSvc, cfg.FrontendURL)
 	calendarHandler := handler.NewCalendarHandler(db)
 	todayHandler := handler.NewTodayHandler(db)
 	taskHandler := handler.NewTaskHandler(db)
@@ -89,6 +101,17 @@ func main() {
 	habitHandler := handler.NewHabitHandler(db)
 	focusHandler := handler.NewFocusHandler(db)
 	noteHandler := handler.NewNoteHandler(db)
+	var driveHandler *handler.DriveHandler // nil service: /drive answers 503
+	if googleSvc != nil {
+		drv := googlecal.NewDrive(cfg.GoogleClientID, cfg.GoogleClientSecret)
+		noteHandler.SetDrive(googlecal.NewNotesService(googleSvc, drv))
+		driveHandler = handler.NewDriveHandler(googlecal.NewFilesService(googleSvc, drv))
+		tasksSvc := googlecal.NewTasksService(googleSvc, googlecal.NewTasks(cfg.GoogleClientID, cfg.GoogleClientSecret))
+		taskHandler.SetGoogle(tasksSvc)
+		todayHandler.SetGoogle(tasksSvc)
+	} else {
+		driveHandler = handler.NewDriveHandler(nil)
+	}
 	reviewHandler := handler.NewReviewHandler(db)
 	focusRuleHandler := handler.NewFocusRuleHandler(db)
 	searchHandler := handler.NewSearchHandler(db)
@@ -101,7 +124,13 @@ func main() {
 			auth.POST("/login", authHandler.Login)
 			auth.POST("/refresh", authHandler.Refresh)
 			auth.POST("/logout", authHandler.Logout)
+			// Browser redirects: no bearer token (the callback proves identity via state + nonce cookie).
+			auth.GET("/google/login", authHandler.GoogleLogin)
+			auth.GET("/google/callback", authHandler.GoogleCallback)
 		}
+
+		// OAuth redirect from the browser: no bearer token, user comes from `state`.
+		v1.GET("/integrations/google/callback", googleHandler.Callback)
 
 		// Protected routes
 		protected := v1.Group("")
@@ -130,15 +159,7 @@ func main() {
 			protected.GET("/calendar", calendarHandler.List)
 			protected.GET("/today", todayHandler.Get)
 
-			protected.GET("/tasks", taskHandler.List)
-			protected.POST("/tasks", taskHandler.Create)
-			protected.GET("/tasks/:id", taskHandler.Get)
-			protected.PUT("/tasks/:id", taskHandler.Update)
-			protected.DELETE("/tasks/:id", taskHandler.Delete)
-			protected.POST("/tasks/:id/complete", taskHandler.Complete)
-			protected.POST("/tasks/:id/subtasks", taskHandler.AddSubtask)
-			protected.PUT("/tasks/:id/subtasks/:sid", taskHandler.UpdateSubtask)
-			protected.DELETE("/tasks/:id/subtasks/:sid", taskHandler.DeleteSubtask)
+			handler.RegisterTaskRoutes(protected, taskHandler)
 
 			protected.GET("/routines", routineHandler.List)
 			protected.POST("/routines", routineHandler.Create)
@@ -180,11 +201,8 @@ func main() {
 			protected.POST("/focus-sessions/:id/complete", focusHandler.Complete)
 			protected.POST("/focus-sessions/:id/cancel", focusHandler.Cancel)
 
-			protected.GET("/notes", noteHandler.List)
-			protected.POST("/notes", noteHandler.Create)
-			protected.GET("/notes/:id", noteHandler.Get)
-			protected.PUT("/notes/:id", noteHandler.Update)
-			protected.DELETE("/notes/:id", noteHandler.Delete)
+			handler.RegisterNoteRoutes(protected, noteHandler)
+			handler.RegisterDriveRoutes(protected, driveHandler)
 
 			protected.GET("/daily-reviews", reviewHandler.List)
 			protected.GET("/daily-reviews/:date", reviewHandler.Get)
@@ -198,12 +216,21 @@ func main() {
 			protected.DELETE("/focus-rules/:id", focusRuleHandler.Delete)
 
 			protected.GET("/search", searchHandler.Search)
+
+			protected.POST("/schedules/:id/google-retry", scheduleHandler.GoogleRetry)
+			protected.POST("/integrations/google/connect", googleHandler.Connect)
+			protected.GET("/integrations/google/status", googleHandler.Status)
+			protected.POST("/integrations/google/sync", googleHandler.Sync)
+			protected.POST("/integrations/google/upload-local", googleHandler.UploadLocal)
+			protected.DELETE("/integrations/google", googleHandler.Disconnect)
 		}
 	}
 
 	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Background jobs: reminder scheduler + Asynq worker. Both stop with the
@@ -223,6 +250,10 @@ func main() {
 			}
 		}()
 		go scheduler.Run(jobCtx, db, queueClient, scheduler.DefaultInterval)
+	}
+
+	if googleSvc != nil && os.Getenv("ENABLE_GOOGLE_SYNC") != "false" {
+		go googleSvc.Run(jobCtx, 5*time.Minute)
 	}
 
 	go func() {

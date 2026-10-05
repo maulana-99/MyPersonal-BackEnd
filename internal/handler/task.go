@@ -3,6 +3,7 @@ package handler
 import (
 	"time"
 
+	"github.com/chronaxis/daily-planner-backend/internal/googlecal"
 	"github.com/chronaxis/daily-planner-backend/internal/middleware"
 	"github.com/chronaxis/daily-planner-backend/pkg/response"
 	"github.com/gin-gonic/gin"
@@ -12,7 +13,8 @@ import (
 
 // TaskHandler owns tasks and their subtasks.
 type TaskHandler struct {
-	db *pgxpool.Pool
+	db     *pgxpool.Pool
+	google *googlecal.TasksService // nil = tasks are always local
 }
 
 func NewTaskHandler(db *pgxpool.Pool) *TaskHandler {
@@ -36,6 +38,13 @@ type Task struct {
 	Subtasks    []Subtask  `json:"subtasks"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
+
+	// Google-shaped fields, defaults only in local mode.
+	Notes       string     `json:"notes"`
+	CompletedAt *time.Time `json:"completed_at"`
+	Parent      *string    `json:"parent"`
+	Position    string     `json:"position"`
+	WebViewLink *string    `json:"web_view_link"`
 }
 
 type taskRequest struct {
@@ -64,10 +73,17 @@ func scanTaskBase(row rowScanner) (Task, error) {
 		t.DueDate = &s
 	}
 	t.Subtasks = []Subtask{}
+	t.Notes = t.Description
 	return t, nil
 }
 
 func (h *TaskHandler) List(c *gin.Context) {
+	if use, stop := h.useGoogle(c); stop {
+		return
+	} else if use {
+		h.gList(c)
+		return
+	}
 	userID := middleware.GetUserID(c)
 	p := pagination(c)
 
@@ -146,6 +162,12 @@ func (h *TaskHandler) List(c *gin.Context) {
 }
 
 func (h *TaskHandler) Get(c *gin.Context) {
+	if use, stop := h.useGoogle(c); stop {
+		return
+	} else if use {
+		h.gGet(c)
+		return
+	}
 	id, ok := paramUUID(c, "id")
 	if !ok {
 		return
@@ -169,6 +191,12 @@ func (h *TaskHandler) Get(c *gin.Context) {
 }
 
 func (h *TaskHandler) Create(c *gin.Context) {
+	if use, stop := h.useGoogle(c); stop {
+		return
+	} else if use {
+		h.gCreate(c)
+		return
+	}
 	var req taskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
@@ -206,6 +234,12 @@ func (h *TaskHandler) Create(c *gin.Context) {
 }
 
 func (h *TaskHandler) Update(c *gin.Context) {
+	if use, stop := h.useGoogle(c); stop {
+		return
+	} else if use {
+		h.gUpdate(c)
+		return
+	}
 	id, ok := paramUUID(c, "id")
 	if !ok {
 		return
@@ -257,6 +291,12 @@ func (h *TaskHandler) Update(c *gin.Context) {
 }
 
 func (h *TaskHandler) Delete(c *gin.Context) {
+	if use, stop := h.useGoogle(c); stop {
+		return
+	} else if use {
+		h.gDelete(c)
+		return
+	}
 	id, ok := paramUUID(c, "id")
 	if !ok {
 		return
@@ -277,6 +317,12 @@ func (h *TaskHandler) Delete(c *gin.Context) {
 
 // Complete toggles pending <-> completed.
 func (h *TaskHandler) Complete(c *gin.Context) {
+	if use, stop := h.useGoogle(c); stop {
+		return
+	} else if use {
+		h.gComplete(c)
+		return
+	}
 	id, ok := paramUUID(c, "id")
 	if !ok {
 		return

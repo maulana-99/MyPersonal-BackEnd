@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"errors"
 	"time"
 
+	"github.com/chronaxis/daily-planner-backend/internal/googlecal"
 	"github.com/chronaxis/daily-planner-backend/internal/middleware"
 	"github.com/chronaxis/daily-planner-backend/pkg/response"
 	"github.com/gin-gonic/gin"
@@ -11,8 +13,12 @@ import (
 
 // TodayHandler aggregates everything the Today view needs in one round-trip.
 type TodayHandler struct {
-	db *pgxpool.Pool
+	db    *pgxpool.Pool
+	tasks *googlecal.TasksService // nil = tasks are always local
 }
+
+// SetGoogle enables Google Tasks for users with a Google connection.
+func (h *TodayHandler) SetGoogle(t *googlecal.TasksService) { h.tasks = t }
 
 func NewTodayHandler(db *pgxpool.Pool) *TodayHandler {
 	return &TodayHandler{db: db}
@@ -39,7 +45,8 @@ type TodayResponse struct {
 		Completed []Schedule `json:"completed"`
 		Missed    []Schedule `json:"missed"`
 	} `json:"schedules"`
-	Tasks        []TodayTask   `json:"tasks"`
+	Tasks        any           `json:"tasks"` // []TodayTask, or []googlecal.TaskItem in Google mode
+	TasksError   string        `json:"tasks_error,omitempty"`
 	Progress     TodayProgress `json:"progress"`
 	NextUpcoming *Schedule     `json:"next_upcoming"`
 }
@@ -58,12 +65,14 @@ func (h *TodayHandler) Get(c *gin.Context) {
 	resp.Schedules.Ongoing = []Schedule{}
 	resp.Schedules.Completed = []Schedule{}
 	resp.Schedules.Missed = []Schedule{}
-	resp.Tasks = []TodayTask{}
+	var tasks []TodayTask
 
 	rows, err := h.db.Query(c, `
 		SELECT s.id, NULL::uuid AS occurrence_id, s.category_id, s.title,
 		       COALESCE(s.description, ''), s.start_time, s.end_time, s.all_day,
-		       s.status, COALESCE(r.rule, ''), s.created_at, s.updated_at
+		       s.status, COALESCE(r.rule, ''), s.created_at, s.updated_at,
+		       s.source, s.google_event_id, s.google_sync_state, s.google_sync_error,
+			       s.location, s.color_id, s.meet_link, s.tz
 		FROM schedules s
 		LEFT JOIN schedule_recurrences r ON r.schedule_id = s.id
 		WHERE s.user_id = $1
@@ -75,7 +84,9 @@ func (h *TodayHandler) Get(c *gin.Context) {
 
 		SELECT s.id, o.id AS occurrence_id, s.category_id, s.title,
 		       COALESCE(s.description, ''), o.occurrence_start, o.occurrence_end, s.all_day,
-		       o.status, COALESCE(r.rule, ''), s.created_at, s.updated_at
+		       o.status, COALESCE(r.rule, ''), s.created_at, s.updated_at,
+		       s.source, s.google_event_id, s.google_sync_state, s.google_sync_error,
+			       s.location, s.color_id, s.meet_link, s.tz
 		FROM schedule_occurrences o
 		JOIN schedules s ON s.id = o.schedule_id
 		JOIN schedule_recurrences r ON r.schedule_id = s.id
@@ -92,12 +103,25 @@ func (h *TodayHandler) Get(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	var all []Schedule
 	for rows.Next() {
 		s, err := scanScheduleRow(rows, now)
 		if err != nil {
 			respondDBError(c, err)
 			return
 		}
+		all = append(all, s)
+	}
+	if err := rows.Err(); err != nil {
+		respondDBError(c, err)
+		return
+	}
+	rows.Close()
+	if err := attachAttendees(c, h.db, all); err != nil {
+		respondDBError(c, err)
+		return
+	}
+	for _, s := range all {
 		switch s.Status {
 		case StatusOngoing:
 			resp.Schedules.Ongoing = append(resp.Schedules.Ongoing, s)
@@ -108,10 +132,6 @@ func (h *TodayHandler) Get(c *gin.Context) {
 		default:
 			resp.Schedules.Upcoming = append(resp.Schedules.Upcoming, s)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		respondDBError(c, err)
-		return
 	}
 
 	// Progress counts today's non-skipped schedules.
@@ -129,6 +149,11 @@ func (h *TodayHandler) Get(c *gin.Context) {
 	if len(resp.Schedules.Upcoming) > 0 {
 		next := resp.Schedules.Upcoming[0]
 		resp.NextUpcoming = &next
+	}
+
+	if h.googleToday(c, &resp, dayStart) {
+		response.OK(c, resp)
+		return
 	}
 
 	// Today's tasks (due today or overdue-but-pending, plus undated pending).
@@ -157,12 +182,48 @@ func (h *TodayHandler) Get(c *gin.Context) {
 			s := due.Format("2006-01-02")
 			t.DueDate = &s
 		}
-		resp.Tasks = append(resp.Tasks, t)
+		tasks = append(tasks, t)
 	}
 	if err := taskRows.Err(); err != nil {
 		respondDBError(c, err)
 		return
 	}
 
+	resp.Tasks = append([]TodayTask{}, tasks...)
 	response.OK(c, resp)
+}
+
+// googleToday fills the Google Tasks part of /today and reports whether it
+// applies. A Tasks failure keeps the page alive: empty tasks plus tasks_error.
+func (h *TodayHandler) googleToday(c *gin.Context, resp *TodayResponse, dayStart time.Time) bool {
+	if h.tasks == nil {
+		return false
+	}
+	userID := middleware.GetUserID(c)
+	if err := h.tasks.Require(c, userID); err != nil {
+		if errors.Is(err, googlecal.ErrNotConnected) {
+			return false
+		}
+		resp.Tasks, resp.TasksError = []googlecal.TaskItem{}, tasksErrorCode(err)
+		return true
+	}
+	items, err := h.tasks.Today(c, userID, dayStart.Format("2006-01-02"), dayStart)
+	if err != nil {
+		resp.Tasks, resp.TasksError = []googlecal.TaskItem{}, tasksErrorCode(err)
+		return true
+	}
+	if items == nil {
+		items = []googlecal.TaskItem{}
+	}
+	resp.Tasks = items
+	for _, t := range items {
+		resp.Progress.Total++
+		if t.Status == "completed" {
+			resp.Progress.Completed++
+		}
+	}
+	if resp.Progress.Total > 0 {
+		resp.Progress.Percentage = resp.Progress.Completed * 100 / resp.Progress.Total
+	}
+	return true
 }

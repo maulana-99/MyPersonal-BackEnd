@@ -50,7 +50,17 @@ func Conflict(c *gin.Context, msg string) {
 	c.JSON(http.StatusConflict, envelope{Error: msg})
 }
 
+// Error writes a stable machine-readable error code with the given status.
+func Error(c *gin.Context, status int, code string) {
+	c.JSON(status, envelope{Error: code})
+}
+
 func Internal(c *gin.Context, err error) {
 	// ponytail: no sentry/logging here; add when observability added
 	c.JSON(http.StatusInternalServerError, envelope{Error: "internal server error"})
+}
+
+// ErrorMsg is Error plus a machine-readable detail code in `message`.
+func ErrorMsg(c *gin.Context, status int, code, message string) {
+	c.JSON(status, envelope{Error: code, Message: message})
 }
