@@ -11,6 +11,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -131,16 +132,64 @@ func nonceHash(nonce string) string {
 // LoginStart returns a fresh nonce (for the g_nonce cookie) and the Google
 // consent URL whose signed state embeds the nonce hash.
 func (s *Service) LoginStart() (nonce, authURL string, err error) {
+	return s.loginStart("")
+}
+
+// LoginStartMobile is LoginStart for the app: the state also records
+// client=mobile and the caller-validated PKCE challenge.
+func (s *Service) LoginStartMobile(challenge string) (nonce, authURL string, err error) {
+	return s.loginStart(challenge)
+}
+
+func (s *Service) loginStart(challenge string) (nonce, authURL string, err error) {
 	b := make([]byte, 32)
 	if _, err = rand.Read(b); err != nil {
 		return "", "", err
 	}
 	nonce = base64.RawURLEncoding.EncodeToString(b)
-	state, err := signState(s.stateSecret, loginStatePurpose, nonceHash(nonce), StateTTL)
+	cl := stateClaims{Purpose: loginStatePurpose, RegisteredClaims: jwt.RegisteredClaims{Subject: nonceHash(nonce)}}
+	if challenge != "" {
+		cl.Client, cl.Challenge = ClientMobile, challenge
+	}
+	state, err := signClaims(s.stateSecret, cl, StateTTL)
 	if err != nil {
 		return "", "", err
 	}
 	return nonce, s.client.LoginURL(state), nil
+}
+
+// MobileChallenge reports whether a login state was started by the app and
+// returns its PKCE challenge. An invalid state is never mobile.
+func (s *Service) MobileChallenge(state string) (challenge string, mobile bool) {
+	cl, err := verifyClaims(s.stateSecret, loginStatePurpose, state)
+	if err != nil || cl.Client != ClientMobile || cl.Challenge == "" {
+		return "", false
+	}
+	return cl.Challenge, true
+}
+
+// SignMobileCode issues the one-time code handed to the app (TTL 2 min).
+func (s *Service) SignMobileCode(userID uuid.UUID, challenge string) (string, error) {
+	return SignMobileCodeTTL(s.stateSecret, userID, challenge, MobileCodeTTL)
+}
+
+// SignMobileCodeTTL is SignMobileCode with an explicit lifetime (tests).
+func SignMobileCodeTTL(secret string, userID uuid.UUID, challenge string, ttl time.Duration) (string, error) {
+	return signClaims(secret, stateClaims{Purpose: mobileCodePurpose, Challenge: challenge,
+		RegisteredClaims: jwt.RegisteredClaims{Subject: userID.String(), ID: uuid.NewString()}}, ttl)
+}
+
+// VerifyMobileCode checks signature, purpose and expiry of a mobile code.
+func (s *Service) VerifyMobileCode(code string) (MobileCode, error) {
+	cl, err := verifyClaims(s.stateSecret, mobileCodePurpose, code)
+	if err != nil {
+		return MobileCode{}, err
+	}
+	uid, err := uuid.Parse(cl.Subject)
+	if err != nil || cl.ID == "" || cl.Challenge == "" {
+		return MobileCode{}, errors.New("malformed code")
+	}
+	return MobileCode{UserID: uid, Challenge: cl.Challenge, JTI: cl.ID}, nil
 }
 
 // LoginExchange verifies state AND the nonce cookie value (login CSRF), then

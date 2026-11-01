@@ -88,6 +88,9 @@ func main() {
 	// Handlers
 	authHandler := handler.NewAuthHandler(db, jwtMgr)
 	authHandler.SetGoogle(googleSvc, cfg.FrontendURL, cfg.GoogleAllowedEmails, cfg.AllowPasswordAuth)
+	if enableWorker {
+		authHandler.SetMobile(handler.NewRedisOnce(cfg.RedisAddr, cfg.RedisPassword))
+	}
 	categoryHandler := handler.NewCategoryHandler(db)
 	scheduleHandler := handler.NewScheduleHandler(db, queueClient)
 	scheduleHandler.SetGoogle(googleSvc)
@@ -124,6 +127,7 @@ func main() {
 			auth.POST("/login", authHandler.Login)
 			auth.POST("/refresh", authHandler.Refresh)
 			auth.POST("/logout", authHandler.Logout)
+			auth.POST("/mobile/exchange", authHandler.MobileExchange)
 			// Browser redirects: no bearer token (the callback proves identity via state + nonce cookie).
 			auth.GET("/google/login", authHandler.GoogleLogin)
 			auth.GET("/google/callback", authHandler.GoogleCallback)
