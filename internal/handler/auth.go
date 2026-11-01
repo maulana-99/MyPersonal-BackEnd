@@ -29,6 +29,7 @@ type AuthHandler struct {
 	frontendURL   string
 	allowedEmails []string
 	allowPassword bool
+	once          OnceStore // single-use mobile codes; nil without Redis
 }
 
 // SetGoogle enables Google login. With it on, password register/login answer
@@ -168,8 +169,16 @@ func (h *AuthHandler) setRefreshCookie(c *gin.Context, userID uuid.UUID) error {
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	cookie, err := c.Cookie("refresh_token")
 	if err != nil {
-		response.Unauthorized(c, "missing refresh token")
-		return
+		// Mobile has no cookie jar: refresh token in the body, opt-in via header.
+		var body struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, mobileAuthBodyLimit)
+		if c.GetHeader("X-Client") != googlecal.ClientMobile || c.ShouldBindJSON(&body) != nil || body.RefreshToken == "" {
+			response.Unauthorized(c, "missing refresh token")
+			return
+		}
+		cookie = body.RefreshToken
 	}
 
 	claims, err := h.jwtManager.Verify(cookie)
@@ -224,7 +233,18 @@ func (h *AuthHandler) GoogleLogin(c *gin.Context) {
 		response.Error(c, http.StatusServiceUnavailable, "google_not_configured")
 		return
 	}
-	nonce, authURL, err := h.google.LoginStart()
+	var nonce, authURL string
+	var err error
+	if c.Query("client") == googlecal.ClientMobile {
+		challenge := c.Query("code_challenge")
+		if !pkceChallengeRe.MatchString(challenge) {
+			response.Error(c, http.StatusBadRequest, "invalid_challenge")
+			return
+		}
+		nonce, authURL, err = h.google.LoginStartMobile(challenge)
+	} else {
+		nonce, authURL, err = h.google.LoginStart()
+	}
 	if err != nil {
 		response.Internal(c, err)
 		return
@@ -242,7 +262,12 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
 	}
 	nonce, _ := c.Cookie(nonceCookie)
 	setNonceCookie(c, "", -1) // single use, success or not
+	challenge, mobile := h.google.MobileChallenge(c.Query("state"))
 	fail := func(reason string) {
+		if mobile {
+			c.Redirect(http.StatusFound, mobileRedirect+"?error="+url.QueryEscape(reason))
+			return
+		}
 		c.Redirect(http.StatusFound, h.frontendURL+"/login?error="+url.QueryEscape(reason))
 	}
 
@@ -275,6 +300,16 @@ func (h *AuthHandler) GoogleCallback(c *gin.Context) {
 		return
 	case err != nil:
 		fail(googlecal.ReasonInternal)
+		return
+	}
+	if mobile {
+		code, err := h.google.SignMobileCode(userID, challenge)
+		if err != nil {
+			fail(googlecal.ReasonInternal)
+			return
+		}
+		h.google.SyncBackground(userID)
+		c.Redirect(http.StatusFound, mobileRedirect+"?code="+url.QueryEscape(code))
 		return
 	}
 	if err := h.setRefreshCookie(c, userID); err != nil {
